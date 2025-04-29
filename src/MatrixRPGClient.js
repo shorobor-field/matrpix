@@ -20,71 +20,8 @@ export class MatrixRPGClient {
     this.roomState = {};
     this.userId = null;
     
-    // NEW: Cache for messages to preserve history across sessions
-    this.messageCache = {};
-    this.isLoadingHistory = false;
-    this.historyLoaded = false;
-    
-    // Load saved room and message cache
+    // Load saved room
     this.room = localStorage.getItem('matrixRoom');
-    this._loadMessageCache();
-  }
-
-  // NEW: Methods for preserving message history
-  _loadMessageCache() {
-    try {
-      const cachedData = localStorage.getItem('matrixMessageCache');
-      if (cachedData) {
-        this.messageCache = JSON.parse(cachedData);
-      }
-    } catch (error) {
-      console.error('Error loading message cache:', error);
-      this.messageCache = {};
-    }
-  }
-
-  _saveMessageCache() {
-    try {
-      localStorage.setItem('matrixMessageCache', JSON.stringify(this.messageCache));
-    } catch (error) {
-      console.error('Error saving message cache:', error);
-      // If storage quota exceeded, prune older messages
-      if (error.name === 'QuotaExceededError') {
-        this._pruneMessageCache();
-        try {
-          localStorage.setItem('matrixMessageCache', JSON.stringify(this.messageCache));
-        } catch (e) {
-          console.error('Failed to save even after pruning:', e);
-        }
-      }
-    }
-  }
-
-  _pruneMessageCache() {
-    // For each room, keep only the most recent 1000 messages
-    Object.keys(this.messageCache).forEach(roomId => {
-      const messages = this.messageCache[roomId];
-      if (messages.length > 1000) {
-        this.messageCache[roomId] = messages.slice(messages.length - 1000);
-      }
-    });
-  }
-
-  _addMessageToCache(roomId, message) {
-    if (!this.messageCache[roomId]) {
-      this.messageCache[roomId] = [];
-    }
-    
-    // Check if message already exists in cache by ID
-    const exists = this.messageCache[roomId].some(m => m.id === message.id);
-    if (!exists) {
-      this.messageCache[roomId].push(message);
-      this._saveMessageCache();
-    }
-  }
-
-  _getMessageCache(roomId) {
-    return this.messageCache[roomId] || [];
   }
 
   // Authentication
@@ -181,7 +118,6 @@ export class MatrixRPGClient {
     this.userId = null;
     this.room = null;
     this.roomState = {};
-    // We don't clear message cache on logout to preserve history
   }
 
   // Room management
@@ -203,21 +139,8 @@ export class MatrixRPGClient {
       // Initialize room state
       await this._updateRoomState(room.roomId);
       
-      // First load cached messages if available
-      const cachedMessages = this._getMessageCache(room.roomId);
-      
-      if (cachedMessages.length > 0) {
-        // Process cached messages
-        cachedMessages.forEach(msg => {
-          this._processHistoricalMessage(msg);
-        });
-      }
-      
-      // Then load room history from server
-      this.isLoadingHistory = true;
+      // Load room history
       await this._loadRoomHistory(room.roomId);
-      this.isLoadingHistory = false;
-      this.historyLoaded = true;
       
       this._triggerEvent('roomJoin', { 
         roomId: room.roomId,
@@ -234,30 +157,16 @@ export class MatrixRPGClient {
     }
   }
 
-  // IMPROVED: Better history loading with pagination
   async _loadRoomHistory(roomId) {
-    if (!this.client) return false;
-    
     try {
       const room = this.client.getRoom(roomId);
       if (!room) return false;
       
-      // Signal we're loading history
-      this._triggerEvent('message', {
-        sender: 'system',
-        roomId,
-        text: "Loading message history...",
-        type: 'system',
-        system: true
-      });
-      
       // Store processed events to avoid duplicates
       const processedEvents = new Set();
       
-      // Function to process and cache events
+      // Function to process a batch of events
       const processEvents = (events) => {
-        let newEvents = 0;
-        
         events.forEach(event => {
           const eventId = event.getId();
           
@@ -269,7 +178,6 @@ export class MatrixRPGClient {
           if (event.getType() === 'm.room.message') {
             const content = event.getContent();
             const sender = event.getSender();
-            const timestamp = event.getTs();
             
             // Get power level
             let powerLevel = 0;
@@ -279,154 +187,106 @@ export class MatrixRPGClient {
               powerLevel = this.roomState[roomId].members[sender].powerLevel;
             }
             
-            // Determine message type
+            // Check the message type
             const messageType = content.formatted_body?.type || 'chat'; // Default to chat
             
-            // Prepare message object for caching
-            const messageObj = {
-              id: eventId,
-              sender,
-              roomId,
-              text: content.body,
-              type: messageType,
-              powerLevel,
-              timestamp,
-              historical: true
-            };
-            
-            // Add specific fields based on message type
-            if (messageType === 'roll' && content.format === 'org.matrix.custom.rpg') {
-              messageObj.dice = content.formatted_body.dice;
-              messageObj.rolls = content.formatted_body.rolls;
-              messageObj.hits = content.formatted_body.hits;
-              messageObj.highEvenOdd = content.formatted_body.highEvenOdd;
-              messageObj.lowEvenOdd = content.formatted_body.lowEvenOdd;
-              messageObj.username = content.formatted_body.username;
-            } else if (messageType === 'scene' && content.format === 'org.matrix.custom.rpg') {
-              messageObj.sceneName = content.formatted_body.sceneName;
-              messageObj.sceneType = content.formatted_body.sceneType;
+            // Check if it's a roll message
+            if (content.format === 'org.matrix.custom.rpg' && messageType === 'roll') {
+              // Handle roll message
+              this._triggerEvent('roll', {
+                sender,
+                roomId,
+                text: content.body,
+                dice: content.formatted_body.dice,
+                rolls: content.formatted_body.rolls,
+                hits: content.formatted_body.hits,
+                highEvenOdd: content.formatted_body.highEvenOdd,
+                lowEvenOdd: content.formatted_body.lowEvenOdd,
+                powerLevel,
+                historical: true
+              });
+            } 
+            // Check if it's a scene message
+            else if (content.format === 'org.matrix.custom.rpg' && messageType === 'scene') {
+              this._triggerEvent('scene', {
+                sender,
+                roomId,
+                text: content.body,
+                sceneName: content.formatted_body.sceneName,
+                sceneType: content.formatted_body.sceneType,
+                powerLevel,
+                historical: true
+              });
             }
-            
-            // Cache the message
-            this._addMessageToCache(roomId, messageObj);
-            
-            // Process the message to display it
-            this._processHistoricalMessage(messageObj);
-            
-            newEvents++;
+            // Check if it's a narration message
+            else if (content.format === 'org.matrix.custom.rpg' && messageType === 'narrate') {
+              this._triggerEvent('message', {
+                sender,
+                roomId,
+                text: content.body,
+                type: 'narrate',
+                powerLevel,
+                historical: true
+              });
+            }
+            else {
+              // Handle regular message
+              this._triggerEvent('message', {
+                sender,
+                roomId,
+                text: content.body,
+                type: messageType, // 'game' or 'chat'
+                powerLevel,
+                historical: true
+              });
+            }
           }
         });
-        
-        return newEvents;
       };
       
       // Initial timeline events
       const timeline = room.getLiveTimeline().getEvents();
       processEvents(timeline);
       
-      // IMPROVED: More reliable pagination using Matrix SDK's getRoomEvents
-      const paginateBackward = async (limit = 100) => {
+      // Load historical messages through pagination
+      const loadMoreHistory = async () => {
         try {
-          // Create filter for message events only
-          const filter = {
-            types: ['m.room.message'],
-            limit: limit,
-            rooms: [roomId]
-          };
-          
-          // Get older events from the server
-          const response = await this.client.createMessagesRequest(
-            roomId, 
-            null, // No token means start from most recent
-            limit,
-            'b' // backward
+          // Check if we can paginate backwards
+          const timelineWindow = this.client.createTimelineWindow(
+            room.getEventTimeline(room.getLiveTimeline().getEvents()[0]),
+            50 // Batch size
           );
           
-          if (!response || !response.chunk || response.chunk.length === 0) {
-            // No more history to load
-            this._triggerEvent('message', {
-              sender: 'system',
-              roomId,
-              text: "All message history loaded",
-              type: 'system',
-              system: true,
-              temporary: true
-            });
-            return false;
+          // If we can paginate, load more history
+          if (timelineWindow.canPaginate('b')) {
+            await timelineWindow.paginate('b', 50);
+            const events = timelineWindow.getEvents();
+            processEvents(events);
+            
+            // Continue loading if we can still paginate
+            if (timelineWindow.canPaginate('b')) {
+              // Use setTimeout to prevent blocking the main thread
+              setTimeout(() => loadMoreHistory(), 100);
+            }
           }
-          
-          // Convert raw events to actual MatrixEvent objects
-          const events = response.chunk.map(e => {
-            const event = this.client.getEventMapper()(e);
-            return event;
-          });
-          
-          const newEvents = processEvents(events);
-          
-          // If we got new events and there are more to load (token exists)
-          if (response.end && newEvents > 0) {
-            // Continue pagination with delay to prevent rate limits
-            await new Promise(resolve => setTimeout(resolve, 500));
-            return await paginateBackward(limit);
-          }
-          
-          return false;
         } catch (error) {
-          console.error('Pagination error:', error);
-          
-          // Handle rate limiting
+          // Handle rate limiting or other errors
+          console.error('Error loading more history:', error);
+          // If rate limited, wait a bit longer
           if (error.errcode === 'M_LIMIT_EXCEEDED') {
             const retryAfter = error.data?.retry_after_ms || 5000;
-            await new Promise(resolve => setTimeout(resolve, retryAfter));
-            return await paginateBackward(limit);
+            setTimeout(() => loadMoreHistory(), retryAfter);
           }
-          
-          this._triggerEvent('message', {
-            sender: 'system',
-            roomId,
-            text: "Couldn't load more history: " + (error.message || 'Unknown error'),
-            type: 'system',
-            system: true,
-            temporary: true
-          });
-          
-          return false;
         }
       };
       
-      // Start pagination process
-      await paginateBackward();
+      // Start loading history
+      await loadMoreHistory();
       
       return true;
     } catch (error) {
       console.error('Error loading room history:', error);
-      
-      this._triggerEvent('message', {
-        sender: 'system',
-        roomId,
-        text: "Error loading history: " + (error.message || 'Unknown error'),
-        type: 'system',
-        system: true,
-        temporary: true
-      });
-      
       return false;
-    }
-  }
-
-  // NEW: Process historical messages
-  _processHistoricalMessage(msg) {
-    // Skip if this is during initial history loading
-    if (this.isLoadingHistory && !msg.important) return;
-    
-    // Determine the type of message and trigger the appropriate event
-    if (msg.type === 'roll') {
-      this._triggerEvent('roll', msg);
-    } else if (msg.type === 'scene') {
-      this._triggerEvent('scene', msg);
-    } else {
-      // For regular, narration, and system messages
-      this._triggerEvent('message', msg);
     }
   }
 
@@ -478,8 +338,8 @@ export class MatrixRPGClient {
     }
 
     try {
-      // Send message with custom format to indicate type
-      const response = await this.client.sendEvent(this.room, "m.room.message", {
+      // Send message with custom format to indicate type - no need to replace + anymore
+      await this.client.sendEvent(this.room, "m.room.message", {
         msgtype: "m.text",
         body: text,
         format: "org.matrix.custom.rpg",
@@ -487,21 +347,6 @@ export class MatrixRPGClient {
           type: type // 'game' or 'chat'
         }
       });
-      
-      // Cache our own message immediately
-      const messageObj = {
-        id: response.event_id,
-        sender: this.userId,
-        roomId: this.room,
-        text: text,
-        type: type,
-        powerLevel: this.roomState[this.room]?.members[this.userId]?.powerLevel || 0,
-        timestamp: Date.now(),
-        self: true // Mark as our own message
-      };
-      
-      this._addMessageToCache(this.room, messageObj);
-      
       return true;
     } catch (error) {
       this._triggerEvent('error', { 
@@ -527,7 +372,7 @@ export class MatrixRPGClient {
       const sceneText = `${sceneName}`;
       
       // Send as a special scene message
-      const response = await this.client.sendEvent(this.room, "m.room.message", {
+      await this.client.sendEvent(this.room, "m.room.message", {
         msgtype: "m.text",
         body: sceneText,
         format: "org.matrix.custom.rpg",
@@ -537,22 +382,6 @@ export class MatrixRPGClient {
           sceneType: sceneType
         }
       });
-      
-      // Cache our own scene immediately
-      const sceneObj = {
-        id: response.event_id,
-        sender: this.userId,
-        roomId: this.room,
-        text: sceneText,
-        type: 'scene',
-        sceneName: sceneName,
-        sceneType: sceneType,
-        powerLevel: this.roomState[this.room]?.members[this.userId]?.powerLevel || 0,
-        timestamp: Date.now(),
-        self: true
-      };
-      
-      this._addMessageToCache(this.room, sceneObj);
       
       return true;
     } catch (error) {
@@ -576,7 +405,7 @@ export class MatrixRPGClient {
 
     try {
       // Send as a special narration message
-      const response = await this.client.sendEvent(this.room, "m.room.message", {
+      await this.client.sendEvent(this.room, "m.room.message", {
         msgtype: "m.text",
         body: text,
         format: "org.matrix.custom.rpg",
@@ -584,20 +413,6 @@ export class MatrixRPGClient {
           type: "narrate"
         }
       });
-      
-      // Cache our own narration immediately
-      const narrationObj = {
-        id: response.event_id,
-        sender: this.userId,
-        roomId: this.room,
-        text: text,
-        type: 'narrate',
-        powerLevel: this.roomState[this.room]?.members[this.userId]?.powerLevel || 0,
-        timestamp: Date.now(),
-        self: true
-      };
-      
-      this._addMessageToCache(this.room, narrationObj);
       
       return true;
     } catch (error) {
@@ -637,40 +452,15 @@ export class MatrixRPGClient {
       }
       
       if (!lastMessageEvent) {
-        // If not found in timeline, check cache for our last message
-        if (this.messageCache[this.room]) {
-          const userMessages = this.messageCache[this.room]
-            .filter(msg => msg.sender === this.userId)
-            .sort((a, b) => b.timestamp - a.timestamp);
-          
-          if (userMessages.length > 0) {
-            lastMessageEvent = { getId: () => userMessages[0].id };
-          }
-        }
-        
-        if (!lastMessageEvent) {
-          this._triggerEvent('error', { 
-            context: 'deleteMessage', 
-            message: 'No messages found to delete' 
-          });
-          return false;
-        }
+        this._triggerEvent('error', { 
+          context: 'deleteMessage', 
+          message: 'No messages found to delete' 
+        });
+        return false;
       }
       
       // Redact the message
       await this.client.redactEvent(this.room, lastMessageEvent.getId());
-      
-      // Update cache to mark as redacted
-      if (this.messageCache[this.room]) {
-        this.messageCache[this.room] = this.messageCache[this.room].map(msg => {
-          if (msg.id === lastMessageEvent.getId()) {
-            return { ...msg, redacted: true };
-          }
-          return msg;
-        });
-        this._saveMessageCache();
-      }
-      
       return true;
     } catch (error) {
       this._triggerEvent('error', { 
@@ -706,20 +496,6 @@ export class MatrixRPGClient {
         }
       }
       
-      // Check cache for additional messages
-      if (this.messageCache[this.room]) {
-        const cachedUserMessages = this.messageCache[this.room]
-          .filter(msg => msg.sender === this.userId && !msg.redacted);
-        
-        // Add IDs not already in userEvents
-        const eventIds = userEvents.map(e => e.getId());
-        cachedUserMessages.forEach(msg => {
-          if (!eventIds.includes(msg.id)) {
-            userEvents.push({ getId: () => msg.id });
-          }
-        });
-      }
-      
       if (userEvents.length === 0) {
         this._triggerEvent('error', { 
           context: 'clearMessages', 
@@ -731,28 +507,14 @@ export class MatrixRPGClient {
       // Redact all messages
       for (const event of userEvents) {
         await this.client.redactEvent(this.room, event.getId());
-        
-        // Update cache immediately after each redaction
-        if (this.messageCache[this.room]) {
-          this.messageCache[this.room] = this.messageCache[this.room].map(msg => {
-            if (msg.id === event.getId()) {
-              return { ...msg, redacted: true };
-            }
-            return msg;
-          });
-        }
       }
-      
-      // Save cache after all updates
-      this._saveMessageCache();
       
       this._triggerEvent('message', {
         sender: this.userId,
         roomId: this.room,
         text: `Cleared ${userEvents.length} messages`,
         type: 'system',
-        system: true,
-        important: true
+        system: true
       });
       
       return true;
@@ -796,12 +558,8 @@ export class MatrixRPGClient {
       this.client.stopClient();
     }
     
-    // Clear all storage except message cache
-    localStorage.removeItem('matrixAccessToken');
-    localStorage.removeItem('matrixUserId');
-    localStorage.removeItem('matrixUsername');
-    localStorage.removeItem('matrixPassword');
-    localStorage.removeItem('matrixRoom');
+    // Clear all storage
+    localStorage.clear();
     
     // Set a flag in sessionStorage to prevent auto-login on next load
     sessionStorage.setItem('matrixReset', 'true');
@@ -812,15 +570,6 @@ export class MatrixRPGClient {
     this.userId = null;
     this.roomState = {};
     
-    // We don't clear message cache on reset to preserve history
-    
-    return true;
-  }
-
-  // NEW: Method to clear message cache if needed
-  clearMessageCache() {
-    this.messageCache = {};
-    localStorage.removeItem('matrixMessageCache');
     return true;
   }
 
@@ -861,7 +610,7 @@ export class MatrixRPGClient {
       const rollText = `🎲 @${username} ${notation}: [${rollResult.rolls.join('][')}] = ${hits} hit${hits !== 1 ? 's' : ''}, high ${highEvenOdd}, low ${lowEvenOdd}`;
       
       // Send as a special roll message
-      const response = await this.client.sendEvent(this.room, "m.room.message", {
+      await this.client.sendEvent(this.room, "m.room.message", {
         msgtype: "m.text",
         body: rollText,
         format: "org.matrix.custom.rpg",
@@ -875,30 +624,6 @@ export class MatrixRPGClient {
           username: username
         }
       });
-      
-      // Cache our own roll immediately
-      const rollObj = {
-        id: response.event_id,
-        sender: this.userId,
-        roomId: this.room,
-        text: rollText,
-        type: 'roll',
-        dice: notation,
-        rolls: rollResult.rolls,
-        hits: hits,
-        highEvenOdd: highEvenOdd,
-        lowEvenOdd: lowEvenOdd,
-        username: username,
-        powerLevel: (this.roomState[this.room] && 
-                     this.roomState[this.room].members && 
-                     this.roomState[this.room].members[this.userId]) 
-                   ? this.roomState[this.room].members[this.userId].powerLevel 
-                   : 0,
-        timestamp: Date.now(),
-        self: true
-      };
-      
-      this._addMessageToCache(this.room, rollObj);
       
       return true;
     } catch (error) {
@@ -981,10 +706,6 @@ export class MatrixRPGClient {
       return this.reset();
     }
     
-    else if (input.startsWith('/clear-cache')) {
-      return this.clearMessageCache();
-    }
-    
     else if (input.startsWith('/roll ')) {
       const notation = input.split(' ')[1];
       if (!notation || !notation.match(/^\d+d\d+$/)) {
@@ -1010,20 +731,6 @@ export class MatrixRPGClient {
       }
       
       return await this.sendScene(sceneName, 'regular');
-    }
-    
-    else if (input === 'narrate' || input.startsWith('narrate ')) {
-      // Get narration text (everything after 'narrate ')
-      const narrationText = input === 'narrate' ? '' : input.substring(8).trim();
-      if (!narrationText) {
-        this._triggerEvent('error', { 
-          context: 'command', 
-          message: 'Usage: narrate Your narration text' 
-        });
-        return false;
-      }
-      
-      return await this.sendNarration(narrationText);
     }
     
     else if (input.startsWith('/narrate ')) {
@@ -1082,13 +789,6 @@ export class MatrixRPGClient {
         const content = event.getContent();
         const sender = event.getSender();
         const roomId = room.roomId;
-        const eventId = event.getId();
-        
-        // Skip if we already have this event in cache (prevents duplicates)
-        if (this.messageCache[roomId] && 
-            this.messageCache[roomId].some(m => m.id === eventId)) {
-          return;
-        }
         
         // Get power level
         let powerLevel = 0;
@@ -1101,75 +801,52 @@ export class MatrixRPGClient {
         // Determine message type
         const messageType = content.formatted_body?.type || 'chat'; // Default to chat
         
-        // Prepare base message object for caching
-        const messageObj = {
-          id: eventId,
-          sender,
-          roomId,
-          text: content.body,
-          type: messageType,
-          powerLevel,
-          timestamp: event.getTs(),
-          self: sender === this.userId
-        };
-        
         // Check if it's a roll message
         if (content.format === 'org.matrix.custom.rpg' && messageType === 'roll') {
-          // Add roll-specific fields
-          messageObj.dice = content.formatted_body.dice;
-          messageObj.rolls = content.formatted_body.rolls;
-          messageObj.hits = content.formatted_body.hits;
-          messageObj.highEvenOdd = content.formatted_body.highEvenOdd;
-          messageObj.lowEvenOdd = content.formatted_body.lowEvenOdd;
-          messageObj.username = content.formatted_body.username;
-          
-          // Cache message
-          this._addMessageToCache(roomId, messageObj);
-          
           // Handle roll message
-          this._triggerEvent('roll', messageObj);
+          this._triggerEvent('roll', {
+            sender,
+            roomId,
+            text: content.body,
+            dice: content.formatted_body.dice,
+            rolls: content.formatted_body.rolls,
+            hits: content.formatted_body.hits,
+            highEvenOdd: content.formatted_body.highEvenOdd,
+            lowEvenOdd: content.formatted_body.lowEvenOdd,
+            username: content.formatted_body.username,
+            powerLevel
+          });
         }
         // Check if it's a scene message
         else if (content.format === 'org.matrix.custom.rpg' && messageType === 'scene') {
-          // Add scene-specific fields
-          messageObj.sceneName = content.formatted_body.sceneName;
-          messageObj.sceneType = content.formatted_body.sceneType;
-          
-          // Cache message
-          this._addMessageToCache(roomId, messageObj);
-          
-          // Trigger event
-          this._triggerEvent('scene', messageObj);
+          this._triggerEvent('scene', {
+            sender,
+            roomId,
+            text: content.body,
+            sceneName: content.formatted_body.sceneName,
+            sceneType: content.formatted_body.sceneType,
+            powerLevel
+          });
         } 
         // Check if it's a narration message
         else if (content.format === 'org.matrix.custom.rpg' && messageType === 'narrate') {
-          // Cache message
-          this._addMessageToCache(roomId, messageObj);
-          
-          // Trigger event
-          this._triggerEvent('message', messageObj);
+          this._triggerEvent('message', {
+            sender,
+            roomId,
+            text: content.body,
+            type: 'narrate',
+            powerLevel
+          });
         }
         else {
           // Handle regular message
-          // Cache message
-          this._addMessageToCache(roomId, messageObj);
-          
-          // Trigger event
-          this._triggerEvent('message', messageObj);
-        }
-      }
-      // Handle redactions to update our cache
-      else if (event.getType() === 'm.room.redaction') {
-        const redactedId = event.getAssociatedId();
-        if (redactedId && this.messageCache[room.roomId]) {
-          // Mark as redacted in cache
-          this.messageCache[room.roomId] = this.messageCache[room.roomId].map(msg => {
-            if (msg.id === redactedId) {
-              return { ...msg, redacted: true };
-            }
-            return msg;
+          this._triggerEvent('message', {
+            sender,
+            roomId,
+            text: content.body,
+            type: messageType,
+            powerLevel
           });
-          this._saveMessageCache();
         }
       }
       
